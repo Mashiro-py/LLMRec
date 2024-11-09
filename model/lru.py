@@ -11,7 +11,7 @@ class LRURec(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.embedding = LRU_LLM_Embedding_mix(self.args)
+        self.embedding = LRU_CAF_Embedding(self.args)
         self.model = LRUModel(self.args)
         self.truncated_normal_init()
 
@@ -43,104 +43,50 @@ class LRURec(nn.Module):
         return scores
 
 
-class FeatureAlignment(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super().__init__()
-        # 特征变换层
-        self.alignment = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-
-        # 可学习的权重
-        self.alpha = nn.Parameter(torch.FloatTensor([0.1]))
-
-    def forward(self, x):
-        # 特征对齐
-        aligned = self.alignment(x)
-        # 特征归一化
-        return F.normalize(aligned, p=2, dim=-1)
-
-
-class HierarchicalFeatures(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        # 低层特征提取
-        self.low_level = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_size)
-        )
-
-        # 高层特征提取
-        self.high_level = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_size)
-        )
-
-        # 特征融合门控
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.Sigmoid()
-        )
-
-    def forward(self, id_emb, text_emb):
-        # 提取低层特征
-        low_features = self.low_level(id_emb)
-
-        # 提取高层特征
-        high_features = self.high_level(text_emb)
-
-        # 特征拼接
-        combined = torch.cat([low_features, high_features], dim=-1)
-
-        # 计算融合门控权重
-        gate = self.fusion_gate(combined)
-
-        # 加权融合
-        fused = gate * low_features + (1 - gate) * high_features
-
-        return F.normalize(fused, p=2, dim=-1)
-
-
-class LRU_LLM_Embedding_mix(nn.Module):
+class LRU_CAF_Embedding(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
         vocab_size = args.num_items + 2
         embed_size = args.bert_hidden_units
+        self.eps = 1e-6
 
         # ID Embedding
         self.token = nn.Embedding(vocab_size, embed_size)
 
         # 文本特征
         self.text_embeddings = nn.Embedding(vocab_size, args.pretrain_emb_dim, padding_idx=0)
-
-        # 特征对齐层
-        self.feature_alignment = FeatureAlignment(
-            input_dim=args.pretrain_emb_dim,
-            hidden_dim=embed_size
+        self.fc_text = nn.Sequential(
+            nn.Linear(args.pretrain_emb_dim, embed_size),
+            nn.LayerNorm(embed_size),
+            nn.Dropout(args.bert_dropout)
         )
 
-        # 分层特征提取
-        self.hierarchical_features = HierarchicalFeatures(embed_size)
+        # 简化的注意力机制
+        self.attention = nn.Sequential(
+            nn.Linear(embed_size, embed_size // 2),
+            nn.LayerNorm(embed_size // 2),
+            nn.GELU(),
+            nn.Linear(embed_size // 2, 1)
+        )
 
-        # 特征转换层
+        # 特征转换
         self.transform = nn.Sequential(
-            nn.Linear(embed_size, embed_size),
-            nn.ReLU(),
-            nn.LayerNorm(embed_size)
+            nn.Linear(embed_size * 2, embed_size),
+            nn.LayerNorm(embed_size),
+            nn.Dropout(args.bert_dropout),
+            nn.GELU()
+        )
+
+        # 融合门控
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(embed_size * 2, 1),
+            nn.LayerNorm([1]),
+            nn.Sigmoid()
         )
 
         self.layer_norm = nn.LayerNorm(embed_size)
         self.dropout = nn.Dropout(args.bert_dropout)
-
-        # 可学习的融合权重
-        self.fusion_weight = nn.Parameter(torch.FloatTensor([0.1]))
 
         if args.is_use_mm:
             print("---------- Loading Multimodal Features -----------")
@@ -149,130 +95,92 @@ class LRU_LLM_Embedding_mix(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """参数初始化"""
+        """初始化权重"""
         for name, p in self.named_parameters():
-            if 'layer_norm' in name:
-                continue
-            elif 'bias' in name:
+            if 'bias' in name:
                 nn.init.zeros_(p)
-            elif 'fusion_weight' in name:
-                nn.init.constant_(p, 0.1)
             elif len(p.shape) >= 2:
-                nn.init.normal_(p, mean=0.0, std=0.02)
-            else:
-                nn.init.normal_(p, mean=0.0, std=0.02)
+                nn.init.xavier_uniform_(p)
 
     def init_mm_features(self):
-        """初始化多模态特征"""
         text_features = torch.load(self.args.text_embedding_path)
         self.text_embeddings.weight.data[1:-1, :] = text_features
 
     def get_mask(self, x):
-        return (x > 0)
+        """返回布尔类型的mask"""
+        return x > 0
+
+    def safe_attention(self, q, k, mask=None):
+        """安全的注意力计算"""
+        attn_weights = torch.matmul(q, k.transpose(-2, -1))
+        scaling = float(q.size(-1)) ** 0.5
+        attn_weights = attn_weights / (scaling + self.eps)
+
+        if mask is not None:
+            # 确保mask是布尔类型
+            bool_mask = mask.bool()
+            # 创建attention mask
+            attn_mask = bool_mask.unsqueeze(1) & bool_mask.unsqueeze(2)
+            attn_weights = attn_weights.masked_fill(~attn_mask, -1e4)
+
+        # 截断极端值
+        attn_weights = torch.clamp(attn_weights, min=-1e2, max=1e2)
+        attn_probs = F.softmax(attn_weights, dim=-1)
+        return self.dropout(attn_probs)
 
     def forward(self, x):
-        mask = self.get_mask(x)
+        try:
+            # 获取布尔类型mask
+            mask = self.get_mask(x)
+            batch_size, seq_len = x.shape[0], x.shape[1]
 
-        # 1. 获取ID embedding
-        item_embeddings = self.token(x)
-        item_embeddings = F.normalize(item_embeddings, p=2, dim=-1)
+            # 1. ID embedding
+            # 局部特征通过ID embedding获取
+            id_embeddings = self.token(x)
+            id_embeddings = F.normalize(id_embeddings, dim=-1, eps=self.eps)
 
-        if self.args.is_use_text:
-            try:
-                # 2. 获取文本特征
-                text_emb = self.text_embeddings(x)
+            if not self.args.is_use_text:
+                return self.layer_norm(id_embeddings), mask
 
-                # 3. 特征对齐和归一化
-                aligned_text = self.feature_alignment(text_emb)
-
-                # 4. 分层特征提取和融合
-                fused_features = self.hierarchical_features(item_embeddings, aligned_text)
-
-                # 5. 特征转换
-                fused_features = self.transform(fused_features)
-
-                # 6. 动态加权组合
-                fusion_gate = torch.sigmoid(self.fusion_weight)
-                item_embeddings = fusion_gate * item_embeddings + (1 - fusion_gate) * fused_features
-
-                # 7. 最终归一化
-                item_embeddings = F.normalize(item_embeddings, p=2, dim=-1)
-
-            except Exception as e:
-                print(f"Error in fusion process: {e}")
-                return item_embeddings, mask
-
-        # 8. Dropout和Layer Norm
-        output = self.layer_norm(self.dropout(item_embeddings))
-
-        return output, mask
-
-
-
-class CrossAttentionFusion(nn.Module):
-    def __init__(self, hidden_size, num_heads=4):
-        super().__init__()
-        self.cross_attention = nn.MultiheadAttention(hidden_size, num_heads)
-
-    def forward(self, item_emb, text_emb):
-        # [B, L, D] -> [L, B, D]
-        item_emb = item_emb.transpose(0, 1)
-        text_emb = text_emb.transpose(0, 1)
-
-        # 交叉注意力
-        output, _ = self.cross_attention(item_emb, text_emb, text_emb)
-        # [L, B, D] -> [B, L, D]
-        return output.transpose(0, 1)
-
-
-
-class LRU_Cross_LLM_Embedding(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        vocab_size = args.num_items + 2
-        embed_size = args.bert_hidden_units
-
-        # Embeddings
-        self.token = nn.Embedding(vocab_size, embed_size)
-        self.text_embeddings = nn.Embedding(vocab_size, args.pretrain_emb_dim, padding_idx=0)
-
-        # 特征映射层
-        self.fc_text = nn.Linear(args.pretrain_emb_dim, embed_size)
-
-        # 交叉注意力融合层
-        self.cross_fusion = CrossAttentionFusion(embed_size)
-
-        self.layer_norm = nn.LayerNorm(embed_size)
-        self.embed_dropout = nn.Dropout(args.bert_dropout)
-
-        if args.is_use_mm:
-            print("---------- Loading Multimodal Features -----------")
-            self.init_mm_features()
-
-    def init_mm_features(self):
-        """初始化多模态特征"""
-        text_features = torch.load(self.args.text_embedding_path)
-        self.text_embeddings.weight.data[1:-1, :] = text_features
-
-    def get_mask(self, x):
-        return (x > 0)
-
-    def forward(self, x):
-        mask = self.get_mask(x)
-        item_embeddings = self.token(x)
-
-        if self.args.is_use_text:
-            # 获取文本特征
+            # 2. 文本特征
             text_emb = self.text_embeddings(x)
             text_emb = self.fc_text(text_emb)
-            text_emb = F.normalize(text_emb, p=2, dim=-1)
+            text_emb = F.normalize(text_emb, dim=-1, eps=self.eps)
 
-            # 交叉注意力融合
-            item_embeddings = self.cross_fusion(item_embeddings, text_emb)
+            # 3. 计算注意力分数
+            # 全局特征通过注意力机制捕获课程间关系
+            attn_weights = self.safe_attention(id_embeddings, text_emb, mask)
 
-        x = self.layer_norm(self.embed_dropout(item_embeddings))
-        return x, mask
+            # 4. 加权聚合
+            context = torch.matmul(attn_weights, text_emb)
+            context = F.normalize(context, dim=-1, eps=self.eps)
+
+            # 5. 特征拼接和转换
+            # 特征转换和融合
+            concat_features = torch.cat([id_embeddings, context], dim=-1)
+            transformed = self.transform(concat_features)
+
+            # 6. 计算融合门控
+            # 自适应门控
+            gate = self.fusion_gate(concat_features)
+            gate = torch.clamp(gate, min=0.1, max=0.9)
+
+            # 7. 加权融合
+            output = gate * id_embeddings + (1 - gate) * transformed
+
+            # 8. 残差连接和归一化
+            output = self.layer_norm(output + id_embeddings)
+            output = F.normalize(output, dim=-1, eps=self.eps)
+
+            return output, mask
+
+        except Exception as e:
+            print(f"Error in embedding process: {e}")
+            base_emb = self.token(x)
+            return self.layer_norm(F.normalize(base_emb, dim=-1, eps=self.eps)), self.get_mask(x)
+
+
+
 
 
 class LRUEmbedding(nn.Module):
@@ -295,57 +203,7 @@ class LRUEmbedding(nn.Module):
 
 
 
-class LRU_Attention_LLM_Embedding(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.alpha = nn.Parameter(torch.FloatTensor([0.5]))
-        vocab_size = args.num_items + 2
-        embed_size = args.bert_hidden_units
 
-        # ID  Embedding
-        self.token = nn.Embedding(vocab_size, embed_size)
-        # 文本特征
-        self.text_embeddings = nn.Embedding(vocab_size, args.pretrain_emb_dim, padding_idx=0)
-        # 特征映射层
-        self.fc_text = nn.Linear(args.pretrain_emb_dim, embed_size)
-        self.layer_norm = nn.LayerNorm(embed_size)
-        self.embed_dropout = nn.Dropout(args.bert_dropout)
-        self.cross_module = CrossModule()
-
-        if args.is_use_mm:
-            print("---------- Loading Multimodal Features -----------")
-            self.init_mm_features()
-
-    def init_mm_features(self):
-        """初始化多模态特征"""
-        text_features = torch.load(self.args.text_embedding_path)
-        self.text_embeddings.weight.data[1:-1, :] = text_features
-    def get_mask(self, x):
-        return (x > 0)
-
-    def forward(self, x):
-        mask = self.get_mask(x)
-        item_embeddings = self.token(x)  # [B, L, D]
-
-        if self.args.is_use_text:
-            # 获取文本特征
-            text_emb = self.text_embeddings(x)  # [B, L, D]
-            text_emb = self.fc_text(text_emb)  # [B, L, D]
-            text_emb = F.normalize(text_emb, p=2, dim=-1)
-
-            # 计算注意力分数
-            attention_scores = torch.matmul(item_embeddings, text_emb.transpose(-2, -1))  # [B, L, L]
-            attention_scores = attention_scores / math.sqrt(item_embeddings.size(-1))
-            attention_weights = F.softmax(attention_scores, dim=-1)  # [B, L, L]
-
-            # 加权融合
-            fused_embeddings = torch.matmul(attention_weights, text_emb)
-            # 使用alpha进行加权组合
-            item_embeddings = (1 - self.alpha) * item_embeddings + self.alpha * fused_embeddings
-
-        x = self.layer_norm(self.embed_dropout(item_embeddings))
-        return x, mask
 
 
 
